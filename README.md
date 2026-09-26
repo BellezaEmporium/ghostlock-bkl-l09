@@ -1,8 +1,10 @@
-# GhostLock on MRX-W09 — a working root chain for the Huawei MatePad Pro (Kirin 990, EMUI 11, Linux 4.14.116)
+# GhostLock on BKL-L09 — a (working ?) root chain for the Huawei Honor View 10 (Kirin 970, EMUI 10, Linux 4.14.116)
 
-Japanese version (default): [README.md](README.md)
+Japanese version (default): [README.md](README.jp-orig.md)
 
 Port and endgame for **CVE-2026-43499 ("GhostLock")**, verified end-to-end on a real device.
+
+Original description from 0ch4 (credits to him/her for the original implementation).
 
 > **Status: root achieved and verified / complete root achieved / native GMS running.**
 > `rsh -c id` / `su -c id` → `uid=0(root) gid=0(root) … context=u:r:shell:s0`, with a root-owned
