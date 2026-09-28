@@ -236,6 +236,16 @@ What is verified, itemized:
 
 What is **not** yet done: the task/cred leaks (same relay pattern, storm bound liftable now that the context is sane), the futex race/stamp/write primitive (all constants verified, calibration pending), and both endgame routes (source-verified, unfired). The chain's status, one line: **enabler complete, first leak banked, zero known defects in the delivered components, everything downstream specified and constant-ready.**
 
+### Phase 1.5 — slide integration (2026-09-2X)
+
+The exploit binary now boots from the enabler's output: `gl.slide` → `g_slide` at startup, all constants runtime-resolved. The shell-side perf suite is confirmed policy-dead (`leak_task` → 0), exactly as designed around — the phase-2 worker relay (`gl.task` / `gl.waiter`) is the active work item.
+
+```
+$ /data/local/tmp/ghostlock_e --leak
+[+] slide = 0x749800000 (from gl.slide, raw 0xffffff8751884bd0)
+[*] _stext=ffffff8751881000 slide=0000000749800000 task=0 stamp_off=0xa0
+[-] task leak failed    (expected: shell perf is EACCES on this policy)
+```
 ---
 
 ## 5. Layout
