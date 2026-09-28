@@ -47,7 +47,7 @@ already exist — but the **device-specific endgame**:
 | Paranoid State | 3 (Default Huawei state, production method) |
 | Extra | **HKIP** (Huawei Kernel Integrity Protection), HHEE/HISEe |
 
-The bootloader is locked and there is **no public unlock** for Kirin 970 (see §8), so a kernel
+The bootloader is locked and there is **no public unlock** for Kirin 970, so a kernel
 exploit is the only root path on this device.
 
 ---
